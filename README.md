@@ -56,11 +56,43 @@ Configure electrode montages (position, size, current), select simulation qualit
 - **GPU Scheduling** — Multi-GPU Redis-backed job queue for concurrent users
 - **Result Download** — Download segmentation outputs as NIfTI files
 
+## Command-Line Interface (`crown-cli`)
+
+A standalone CLI runs the same segmentation and ROAST TES pipeline locally — no web stack required.
+
+```bash
+pip install crown-cli
+```
+
+> Install PyTorch matching your CUDA version first (see https://pytorch.org/get-started/locally/). Requires Python ≥ 3.8.
+
+Authenticate with HuggingFace, then download models and the ROAST build:
+
+```bash
+hf auth login --token hf_...     # needs read access to smilelab/ repos
+crown models download --all      # UNETR checkpoints
+crown roast download             # compiled ROAST build (needs MATLAB Runtime R2025b)
+```
+
+Core commands:
+
+| Command | Purpose |
+|---------|---------|
+| `crown segment T1.nii.gz --model grace-native` | Segmentation only |
+| `crown simulate roast <session_dir> --t1 T1.nii.gz --model grace-native --recipe "P3 -2 P4 2"` | ROAST TES on existing segmentation |
+| `crown run T1.nii.gz --model grace-native --simulate roast --recipe "P3 -2 P4 2"` | Full pipeline (segment + simulate) |
+| `crown status <job_id> --follow` | Monitor / live-tail a job |
+| `crown cancel <job_id>` | Cancel a queued or running job |
+| `crown models` / `crown roast info` | List models / show ROAST build status |
+
+Jobs run detached; state persists in `~/.crown/jobs.db`. See [`crown-cli/README.md`](crown-cli/README.md) for full docs (the `--space` flag, electrode types, output file formats, config).
+
 ## Architecture
 
 ```
-ui_v2/     Next.js frontend — deployed on Vercel
-api_v2/    FastAPI backend  — deployed via Docker Compose
+ui_v2/      Next.js frontend — deployed on Vercel
+api_v2/     FastAPI backend  — deployed via Docker Compose
+crown-cli/  Standalone CLI   — published to PyPI as crown-cli
 ```
 
 ### Backend services (docker-compose.yml)
