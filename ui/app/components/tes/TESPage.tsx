@@ -4,7 +4,7 @@ import { useState, useCallback, useRef, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import {
   ArrowLeft, Zap, Check, AlertTriangle, Construction,
-  RotateCcw, GitCompare, ChevronDown, Cpu, MemoryStick,
+  RotateCcw, ChevronDown, Cpu, MemoryStick,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -18,13 +18,10 @@ import {
 } from "@/app/components/wizard/steps/ElectrodeConfigPanel";
 import SplitViewer from "@/app/components/viewer/SplitViewer";
 import RoastViewer from "@/app/components/viewer/RoastViewer";
-import TESComparisonViewer from "@/app/components/viewer/TESComparisonViewer";
 import LeaveGuardModal from "@/app/components/LeaveGuardModal";
 import {
   startSimulation,
   connectROASTSSE,
-  startSimNIBSSimulation,
-  connectSimNIBSSSE,
   getHealth,
   getSimulationStatus,
   API_BASE,
@@ -34,7 +31,7 @@ import { loadSegSession } from "@/context/JobContext";
 
 // ─── localStorage key for job persistence across refreshes ───────────────────
 const ACTIVE_SIM_KEY = "grace_active_sim";
-type SavedSim = { sessionId: string; model: string; solver: "roast" | "simnibs"; startedAt: number };
+type SavedSim = { sessionId: string; model: string; startedAt: number };
 
 function saveActiveSim(s: SavedSim) {
   try { localStorage.setItem(ACTIVE_SIM_KEY, JSON.stringify(s)); } catch {}
@@ -85,23 +82,7 @@ const ROAST_STEP_LABELS: Record<string, string> = {
   roast_complete:            "Complete",
 };
 
-const SIMNIBS_STEP_LABELS: Record<string, string> = {
-  simnibs_start:           "Starting",
-  simnibs_prepare:         "Preparing T1",
-  simnibs_seg_ready:       "Segmentation ready",
-  simnibs_charm:           "charm: Atlas registration",
-  simnibs_charm_register:  "charm: Atlas registration",
-  simnibs_charm_surface:   "charm: Building surfaces",
-  simnibs_charm_mesh:      "charm: Meshing",
-  simnibs_charm_done:      "Mesh complete",
-  simnibs_fem_setup:       "FEM: Setting up",
-  simnibs_fem_solve:       "FEM: Solving",
-  simnibs_post:            "Post-processing",
-  simnibs_complete:        "Complete",
-};
-
 // ─── Types ────────────────────────────────────────────────────────────────────
-type Solver    = "simnibs" | "roast" | "both";
 type RunStatus = "pending" | "running" | "complete" | "error";
 
 interface RunConfig {
@@ -124,13 +105,11 @@ interface RunState {
 
 type PanelView =
   | { type: "segmentation" }
-  | { type: "roast";      model: string; runKey: string }
-  | { type: "simnibs";    model: string; runKey: string }
-  | { type: "comparison"; model: string };
+  | { type: "roast"; model: string; runKey: string };
 
 // Key includes anode+cathode so each distinct montage gets its own tab.
-function runKey(model: string, solver: "roast" | "simnibs", anode: string, cathode: string) {
-  return `${model}:${solver}:${anode}:${cathode}`;
+function runKey(model: string, anode: string, cathode: string) {
+  return `${model}:roast:${anode}:${cathode}`;
 }
 function getDisplayName(model: string) {
   return model.replace("-native", "").replace("-fs", "").toUpperCase();
@@ -221,7 +200,6 @@ export default function TESPage() {
 
   // Config
   const [selectedModels, setSelectedModels]     = useState<string[]>([]);
-  const [solver, setSolver]                     = useState<Solver>("roast");
   const [quality, setQuality]                   = useState<"fast" | "standard">("fast");
   const [segSource, setSegSource]               = useState<"nn" | "roast">("nn");
   const [electrodeConfig, setElectrodeConfig]   = useState<ElectrodeConfig>({
@@ -230,7 +208,7 @@ export default function TESPage() {
 
   // Run state
   const [runStates, setRunStates] = useState<Record<string, RunState>>({});
-  const runQueueRef = useRef<{ model: string; solver: "roast" | "simnibs"; key: string }[]>([]);
+  const runQueueRef = useRef<{ model: string; key: string }[]>([]);
   const runningRef  = useRef(false);
 
   // Right-panel view
@@ -294,11 +272,9 @@ export default function TESPage() {
         if (status === "running" || status === "queued") {
           setReconnect(r => r && ({ ...r, status: "running", progress }));
           // Reattach SSE to show live progress
-          const connect = sim.solver === "roast" ? connectROASTSSE : connectSimNIBSSSE;
-          connect(sim.sessionId, (evt) => {
+          connectROASTSSE(sim.sessionId, (evt) => {
             if (evt.type === "progress") {
-              const labels = sim.solver === "roast" ? ROAST_STEP_LABELS : SIMNIBS_STEP_LABELS;
-              setReconnect(r => r && ({ ...r, progress: evt.progress ?? 0, step: evt.event ? (labels[evt.event] ?? evt.event) : "" }));
+              setReconnect(r => r && ({ ...r, progress: evt.progress ?? 0, step: evt.event ? (ROAST_STEP_LABELS[evt.event] ?? evt.event) : "" }));
             }
             if (evt.type === "complete") {
               clearActiveSim();
@@ -347,93 +323,49 @@ export default function TESPage() {
     const recipe   = buildRecipe(electrodeConfig);
     const electype = buildElectype(electrodeConfig);
 
-    if (next.solver === "roast") {
-      setRunState(key, { status: "running", progress: 2, step: "Starting…" });
-      try {
-        const { run_id } = await startSimulation(sessionId!, next.model, quality, recipe, electype, segSource);
-        setRunState(key, { status: "running", progress: 2, step: "Starting…", runId: run_id });
-      } catch (e: unknown) {
-        setRunState(key, { status: "error", error: (e as Error).message });
-        runningRef.current = false;
-        processQueue();
-        return;
-      }
-      saveActiveSim({ sessionId: sessionId!, model: next.model, solver: "roast", startedAt: Date.now() });
-      connectROASTSSE(sessionId!, (evt) => {
-        if (evt.type === "progress") {
-          setRunState(key, {
-            status: "running", progress: evt.progress ?? 0,
-            step: evt.event ? (ROAST_STEP_LABELS[evt.event] ?? evt.event) : "",
-          });
-        }
-        if (evt.type === "complete") {
-          clearActiveSim();
-          setRunState(key, { status: "complete", progress: 100, step: "Complete", completedAt: Date.now() });
-          setPanelView({ type: "roast", model: next.model, runKey: key });
-          runningRef.current = false;
-          processQueue();
-        }
-        if (evt.type === "error") {
-          clearActiveSim();
-          setRunState(key, { status: "error", error: evt.detail || "ROAST error" });
-          runningRef.current = false;
-          processQueue();
-        }
-      }, () => {
-        // SSE dropped without complete/error — unblock the queue
-        clearActiveSim();
-        setRunState(key, { status: "error", error: "Connection lost — simulation may still be running." });
-        runningRef.current = false;
-        processQueue();
-      });
-
-    } else {
-      setRunState(key, { status: "running", progress: 2, step: "Starting…" });
-      try {
-        const { run_id } = await startSimNIBSSimulation(sessionId!, next.model, recipe, electype);
-        setRunState(key, { status: "running", progress: 2, step: "Starting…", runId: run_id });
-      } catch (e: unknown) {
-        setRunState(key, { status: "error", error: (e as Error).message });
-        runningRef.current = false;
-        processQueue();
-        return;
-      }
-      saveActiveSim({ sessionId: sessionId!, model: next.model, solver: "simnibs", startedAt: Date.now() });
-      connectSimNIBSSSE(sessionId!, (evt) => {
-        if (evt.type === "progress") {
-          setRunState(key, {
-            status: "running", progress: evt.progress ?? 0,
-            step: evt.event ? (SIMNIBS_STEP_LABELS[evt.event] ?? evt.event) : "",
-          });
-        }
-        if (evt.type === "complete") {
-          clearActiveSim();
-          setRunState(key, { status: "complete", progress: 100, step: "Complete", completedAt: Date.now() });
-          setPanelView({ type: "simnibs", model: next.model, runKey: key });
-          runningRef.current = false;
-          processQueue();
-        }
-        if (evt.type === "error") {
-          clearActiveSim();
-          setRunState(key, { status: "error", error: evt.detail || "SimNIBS error" });
-          runningRef.current = false;
-          processQueue();
-        }
-      }, () => {
-        clearActiveSim();
-        setRunState(key, { status: "error", error: "Connection lost — simulation may still be running." });
-        runningRef.current = false;
-        processQueue();
-      });
+    setRunState(key, { status: "running", progress: 2, step: "Starting…" });
+    try {
+      const { run_id } = await startSimulation(sessionId!, next.model, quality, recipe, electype, segSource);
+      setRunState(key, { status: "running", progress: 2, step: "Starting…", runId: run_id });
+    } catch (e: unknown) {
+      setRunState(key, { status: "error", error: (e as Error).message });
+      runningRef.current = false;
+      processQueue();
+      return;
     }
+    saveActiveSim({ sessionId: sessionId!, model: next.model, startedAt: Date.now() });
+    connectROASTSSE(sessionId!, (evt) => {
+      if (evt.type === "progress") {
+        setRunState(key, {
+          status: "running", progress: evt.progress ?? 0,
+          step: evt.event ? (ROAST_STEP_LABELS[evt.event] ?? evt.event) : "",
+        });
+      }
+      if (evt.type === "complete") {
+        clearActiveSim();
+        setRunState(key, { status: "complete", progress: 100, step: "Complete", completedAt: Date.now() });
+        setPanelView({ type: "roast", model: next.model, runKey: key });
+        runningRef.current = false;
+        processQueue();
+      }
+      if (evt.type === "error") {
+        clearActiveSim();
+        setRunState(key, { status: "error", error: evt.detail || "ROAST error" });
+        runningRef.current = false;
+        processQueue();
+      }
+    }, () => {
+      // SSE dropped without complete/error — unblock the queue
+      clearActiveSim();
+      setRunState(key, { status: "error", error: "Connection lost — simulation may still be running." });
+      runningRef.current = false;
+      processQueue();
+    });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId, quality, electrodeConfig, segSource]);
 
   const startAllRuns = useCallback(() => {
     if (!sessionId || selectedModels.length === 0) return;
-    const solvers: ("roast" | "simnibs")[] =
-      solver === "both" ? ["roast", "simnibs"] :
-      solver === "roast" ? ["roast"] : ["simnibs"];
 
     const configSnapshot: RunConfig = {
       anode:         electrodeConfig.anode,
@@ -443,21 +375,19 @@ export default function TESPage() {
       quality,
     };
 
-    const queue: { model: string; solver: "roast" | "simnibs"; key: string }[] = [];
+    const queue: { model: string; key: string }[] = [];
     const init: Record<string, RunState> = {};
     for (const m of selectedModels) {
-      for (const s of solvers) {
-        const k = runKey(m, s, configSnapshot.anode, configSnapshot.cathode);
-        queue.push({ model: m, solver: s, key: k });
-        init[k] = { status: "pending", progress: 0, step: "Queued", config: configSnapshot };
-      }
+      const k = runKey(m, configSnapshot.anode, configSnapshot.cathode);
+      queue.push({ model: m, key: k });
+      init[k] = { status: "pending", progress: 0, step: "Queued", config: configSnapshot };
     }
     // Merge into existing state so previously completed runs keep their tabs.
     setRunStates(prev => ({ ...prev, ...init }));
     runQueueRef.current = queue;
     runningRef.current  = false;
     processQueue();
-  }, [selectedModels, solver, processQueue, sessionId, electrodeConfig, quality]);
+  }, [selectedModels, processQueue, sessionId, electrodeConfig, quality]);
 
   // ── Derived ───────────────────────────────────────────────────────────────
   const runEntries = Object.entries(runStates);
@@ -465,26 +395,12 @@ export default function TESPage() {
   const isRunning  = runEntries.some(([, r]) => r.status === "running");
   const allDone    = hasRuns && runEntries.every(([, r]) => r.status === "complete" || r.status === "error");
 
-  // Each distinct model:solver:anode:cathode run gets its own tab.
-  type VisibleRun = { key: string; model: string; solver: "roast" | "simnibs"; state: RunState };
+  // Each distinct model:anode:cathode run gets its own tab.
+  type VisibleRun = { key: string; model: string; state: RunState };
   const visibleRuns: VisibleRun[] = runEntries
     .filter(([, s]) => s.status === "complete" || s.status === "running")
-    .map(([key, state]) => {
-      const parts = key.split(":");
-      return { key, model: parts[0], solver: parts[1] as "roast" | "simnibs", state };
-    });
+    .map(([key, state]) => ({ key, model: key.split(":")[0], state }));
   const completedCount = visibleRuns.filter(r => r.state.status === "complete").length;
-
-  // Comparison tab: models with at least one completed ROAST + one completed SimNIBS.
-  const completedSolversByModel = new Map<string, Set<"roast" | "simnibs">>();
-  for (const { model, solver, state } of visibleRuns) {
-    if (state.status !== "complete") continue;
-    if (!completedSolversByModel.has(model)) completedSolversByModel.set(model, new Set());
-    completedSolversByModel.get(model)!.add(solver);
-  }
-  const comparisonModels = [...completedSolversByModel.entries()]
-    .filter(([, s]) => s.has("roast") && s.has("simnibs"))
-    .map(([m]) => m);
 
   // ── No-session guard ──────────────────────────────────────────────────────
   if (!sessionId || !inputUrl) {
@@ -492,7 +408,6 @@ export default function TESPage() {
     if (reconnect && reconnect.status !== "none") {
       const { sim, status, progress, step } = reconnect;
       const modelLabel = sim.model.replace("-native", "").replace("-fs", "").toUpperCase();
-      const solverLabel = sim.solver === "roast" ? "ROAST" : "SimNIBS";
       const isChecking = status === "checking";
       const isRunning  = status === "running";
       const isDone     = status === "complete";
@@ -506,8 +421,8 @@ export default function TESPage() {
               </p>
               <p className="text-sm text-foreground-muted">
                 {isDone
-                  ? `Your ${solverLabel} simulation for ${modelLabel} finished while you were away.`
-                  : `Your ${solverLabel} simulation for ${modelLabel} is still running in the background.`}
+                  ? `Your ROAST simulation for ${modelLabel} finished while you were away.`
+                  : `Your ROAST simulation for ${modelLabel} is still running in the background.`}
               </p>
             </div>
 
@@ -526,11 +441,11 @@ export default function TESPage() {
             </div>
 
             {isDone && (
-              <div className="grid grid-cols-3 gap-2">
-                {["voltage", "emag", "efield"].map(t => (
+              <div className="grid grid-cols-4 gap-2">
+                {["voltage", "emag", "efield", "jbrain"].map(t => (
                   <a
                     key={t}
-                    href={`${process.env.NEXT_PUBLIC_API_URL ?? "http://10.15.224.253:8100"}/simulate/results/${sim.sessionId}/${sim.model}/${t}`}
+                    href={`${API_BASE}/simulate/results/${sim.sessionId}/${sim.model}/${t}`}
                     download
                     className="flex flex-col items-center gap-1 rounded-lg border border-border bg-background p-2 text-center text-[10px] font-mono font-bold uppercase tracking-widest text-foreground hover:border-accent hover:text-accent transition-colors"
                   >
@@ -648,34 +563,6 @@ export default function TESPage() {
                 );
               })}
             </div>
-          </div>
-
-          {/* ── Solver ── */}
-          <div>
-            <SectionLabel>Solver</SectionLabel>
-            <div className="grid grid-cols-3 gap-1.5">
-              {(["roast", "simnibs", "both"] as Solver[]).map(s => (
-                <button
-                  key={s}
-                  type="button"
-                  onClick={() => setSolver(s)}
-                  className={cn(
-                    "rounded-lg border py-2 text-xs font-medium transition-all focus:outline-none focus:ring-2 focus:ring-ring",
-                    solver === s
-                      ? "border-accent bg-accent/10 text-accent"
-                      : "border-border bg-background text-foreground-muted hover:border-accent/30",
-                  )}
-                >
-                  {s === "simnibs" ? "SimNIBS" : s === "roast" ? "ROAST" : "Both"}
-                </button>
-              ))}
-            </div>
-            <p className="mt-1.5 text-[11px] leading-snug text-foreground-muted">
-              {solver === "simnibs" && "SimNIBS FEM with custom mesh — j-field (current density) output"}
-              {solver === "roast"   && "ROAST-11 MATLAB pipeline — E-field and voltage output"}
-              {solver === "both"    && "Both solvers run sequentially — enables side-by-side comparison"}
-            </p>
-
           </div>
 
           {/* ── Montage presets ── */}
@@ -805,8 +692,8 @@ export default function TESPage() {
             </div>
           </div>
 
-          {/* ── ROAST quality (conditional) ── */}
-          {(solver === "roast" || solver === "both") && (
+          {/* ── ROAST quality ── */}
+          <div>
             <div>
               <SectionLabel>ROAST Quality</SectionLabel>
               <div className="flex gap-1.5">
@@ -832,10 +719,10 @@ export default function TESPage() {
                 <span className="opacity-60">first run may be 3–5 min longer</span>
               </p>
             </div>
-          )}
+          </div>
 
-          {/* ── Segmentation source (ROAST only) ── */}
-          {(solver === "roast" || solver === "both") && (
+          {/* ── Segmentation source ── */}
+          <div>
             <div>
               <SectionLabel>Segmentation Source</SectionLabel>
               <div className="flex gap-2">
@@ -873,7 +760,7 @@ export default function TESPage() {
                 </p>
               )}
             </div>
-          )}
+          </div>
 
           {/* ── Config summary pill ── */}
           <div className="rounded-lg border border-border/60 bg-background px-3 py-2.5 text-[11px] text-foreground-muted">
@@ -883,7 +770,7 @@ export default function TESPage() {
               {electrodeConfig.cathode}(−{electrodeConfig.currentMa}mA)
             </span>
             {" · "}{electrodeConfig.electrodeType}
-            {" · "}{solver === "both" ? "ROAST + SimNIBS" : solver === "roast" ? "ROAST" : "SimNIBS"}
+            {" · "}ROAST
             {selectedModels.length > 0 && (
               <>{" · "}{selectedModels.length} model{selectedModels.length > 1 ? "s" : ""}</>
             )}
@@ -897,12 +784,12 @@ export default function TESPage() {
           {hasRuns && (
             <div className="space-y-3">
               {runEntries.map(([key, state]) => {
-                const [model, sol] = key.split(":");
+                const model = key.split(":")[0];
                 return (
                   <RunCard
                     key={key}
                     label={`${getDisplayName(model)} · ${getSpaceLabel(model)}`}
-                    badge={sol === "roast" ? "ROAST" : "SimNIBS"}
+                    badge="ROAST"
                     state={state}
                   />
                 );
@@ -980,7 +867,7 @@ export default function TESPage() {
             Segmentation
           </button>
 
-          {visibleRuns.map(({ key, model, solver, state }) => {
+          {visibleRuns.map(({ key, model, state }) => {
             const cfg = state.config;
             const space = getSpaceLabel(model);
             const isRunning = state.status === "running";
@@ -988,8 +875,8 @@ export default function TESPage() {
               <button
                 key={key}
                 type="button"
-                onClick={() => setPanelView({ type: solver, model, runKey: key })}
-                className={tabCls(isPanelActive({ type: solver, model, runKey: key }))}
+                onClick={() => setPanelView({ type: "roast", model, runKey: key })}
+                className={tabCls(isPanelActive({ type: "roast", model, runKey: key }))}
               >
                 {isRunning
                   ? <div className="h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-accent border-t-transparent" />
@@ -1000,7 +887,7 @@ export default function TESPage() {
                   <span className="rounded bg-border/60 px-1 py-0.5 text-[10px] font-medium text-foreground-muted">{space}</span>
                 )}
                 <span className="text-foreground-muted">·</span>
-                <span>{solver === "roast" ? "ROAST" : "SimNIBS"}</span>
+                <span>ROAST</span>
                 {cfg && (
                   <span className="font-mono text-[10px] text-foreground-muted">
                     {cfg.anode}→{cfg.cathode} {cfg.currentMa}mA
@@ -1009,26 +896,6 @@ export default function TESPage() {
                 {cfg && !isRunning && (
                   <span className="rounded bg-border/40 px-1 py-0.5 text-[10px] text-foreground-muted">{cfg.quality}</span>
                 )}
-              </button>
-            );
-          })}
-
-          {comparisonModels.map(model => {
-            const space = getSpaceLabel(model);
-            return (
-              <button
-                key={`${model}:comparison`}
-                type="button"
-                onClick={() => setPanelView({ type: "comparison", model })}
-                className={tabCls(isPanelActive({ type: "comparison", model }))}
-              >
-                <GitCompare className="h-3 w-3 shrink-0" />
-                <span className="font-semibold">{getDisplayName(model)}</span>
-                {space && (
-                  <span className="rounded bg-border/60 px-1 py-0.5 text-[10px] font-medium text-foreground-muted">{space}</span>
-                )}
-                <span className="text-foreground-muted">·</span>
-                <span>Compare</span>
               </button>
             );
           })}
@@ -1047,7 +914,7 @@ export default function TESPage() {
               <SplitViewer inputUrl={inputUrl} sessionId={sessionId} models={models} />
             </div>
           )}
-          {(panelView.type === "roast" || panelView.type === "simnibs") && (
+          {panelView.type === "roast" && (
             <div className="h-full p-4">
               {runStates[panelView.runKey]?.status !== "complete" ? (
                 <div className="flex h-full flex-col items-center justify-center gap-3 text-foreground-muted">
@@ -1061,29 +928,10 @@ export default function TESPage() {
                   sessionId={sessionId}
                   modelName={panelView.model}
                   runId={runStates[panelView.runKey]?.runId ?? ""}
-                  solver={panelView.type}
                 />
               )}
             </div>
           )}
-          {panelView.type === "comparison" && (() => {
-            const completedRoastRuns = visibleRuns.filter(r => r.model === panelView.model && r.solver === "roast" && r.state.status === "complete");
-            const completedSimnibsRuns = visibleRuns.filter(r => r.model === panelView.model && r.solver === "simnibs" && r.state.status === "complete");
-            const latestRoast = completedRoastRuns.reduce<VisibleRun | null>((best, r) => !best || (r.state.completedAt ?? 0) > (best.state.completedAt ?? 0) ? r : best, null);
-            const latestSimnibs = completedSimnibsRuns.reduce<VisibleRun | null>((best, r) => !best || (r.state.completedAt ?? 0) > (best.state.completedAt ?? 0) ? r : best, null);
-            return (
-              <div className="h-full p-4">
-                <TESComparisonViewer
-                  key={`${panelView.model}:comparison:${latestRoast?.state.completedAt ?? 0}:${latestSimnibs?.state.completedAt ?? 0}`}
-                  inputUrl={inputUrl}
-                  sessionId={sessionId}
-                  modelName={panelView.model}
-                  roastRunId={latestRoast?.state.runId ?? ""}
-                  simnibsRunId={latestSimnibs?.state.runId ?? ""}
-                />
-              </div>
-            );
-          })()}
         </div>
 
       </div>

@@ -2,14 +2,13 @@
 
 import { useEffect, useRef, useState, useCallback, useId, useMemo } from "react";
 import { Niivue, cmapper } from "@niivue/niivue";
-import { AlertTriangle, Eye, Palette, Info, ZoomIn, MapPin, Layers, Box } from "lucide-react";
-import { getSimulationResult, getSimNIBSResult, type SimNIBSOutputType } from "@/lib/api";
+import { AlertTriangle, Eye, Palette, Info, ZoomIn, MapPin, Layers, Box, Download } from "lucide-react";
+import { getSimulationResult } from "@/lib/api";
 import { COLORMAPS } from "./ViewerControls";
 import type { ColormapId } from "./ViewerControls";
 import { cn } from "@/lib/utils";
 
-// Panel definitions — labels differ between ROAST and SimNIBS
-const ROAST_PANELS = [
+const PANELS = [
   {
     type: "emag",
     label: "E-field Magnitude",
@@ -24,7 +23,7 @@ const ROAST_PANELS = [
     unit: "A/m²",
     description: "Current density magnitude restricted to brain tissue",
     recommended: false,
-    note: "J-map for brain tissue only — comparable to SimNIBS magnJ. Shows how much current reaches cortical and subcortical regions.",
+    note: "J-map for brain tissue only. Shows how much current reaches cortical and subcortical regions.",
   },
   {
     type: "voltage",
@@ -33,25 +32,6 @@ const ROAST_PANELS = [
     description: "Electric potential distribution",
     recommended: false,
     note: "Voltage appears nearly uniform inside brain tissue — the skull (high resistance) absorbs most of the potential drop. Use E-field Magnitude above to assess stimulation strength in the brain.",
-  },
-] as const;
-
-const SIMNIBS_PANELS = [
-  {
-    type: "emag",
-    label: "Current Density (J)",
-    unit: "A/m²",
-    description: "Total current density magnitude across all tissues",
-    recommended: true,
-    note: null,
-  },
-  {
-    type: "voltage",
-    label: "Brain J (WM+GM)",
-    unit: "A/m²",
-    description: "Current density restricted to white and gray matter",
-    recommended: false,
-    note: "Masked to white matter and gray matter only — isolates the current delivered to cortical and subcortical tissue.",
   },
 ] as const;
 
@@ -64,12 +44,9 @@ interface RoastViewerProps {
   sessionId: string;
   modelName: string;
   runId: string;
-  solver?: "roast" | "simnibs";
 }
 
-export default function RoastViewer({ inputUrl, sessionId, modelName, runId, solver = "roast" }: RoastViewerProps) {
-  const PANELS = solver === "simnibs" ? SIMNIBS_PANELS : ROAST_PANELS;
-  // 3 panels for ROAST (emag, jbrain, voltage), 2 for SimNIBS
+export default function RoastViewer({ inputUrl, sessionId, modelName, runId }: RoastViewerProps) {
   const canvasRefs = [useRef<HTMLCanvasElement>(null), useRef<HTMLCanvasElement>(null), useRef<HTMLCanvasElement>(null)];
   const nvRefs = useRef<(Niivue | null)[]>([null, null, null]);
 
@@ -104,9 +81,10 @@ export default function RoastViewer({ inputUrl, sessionId, modelName, runId, sol
   const [elecSlice, setElecSlice]           = useState<"multiplanar" | "axial" | "coronal" | "sagittal">("multiplanar");
   const MASK_BG_DIM = 0.08;
 
-  const colormapDropRef = useRef<HTMLDivElement>(null);
-  const bufferCache     = useRef<Partial<Record<OutputType, ArrayBuffer>>>({});
-  const sliderId        = useId();
+  const colormapDropRef  = useRef<HTMLDivElement>(null);
+  const bufferCache      = useRef<Partial<Record<OutputType, ArrayBuffer>>>({});
+  const elecBufferCache  = useRef<Partial<Record<"mask_elec" | "mask_gel", ArrayBuffer>>>({});
+  const sliderId         = useId();
 
   // Close colormap dropdown on outside click
   useEffect(() => {
@@ -118,26 +96,42 @@ export default function RoastViewer({ inputUrl, sessionId, modelName, runId, sol
     return () => document.removeEventListener("mousedown", handler);
   }, []);
 
-  // Map ROAST panel types to equivalent SimNIBS output types
-  const SIMNIBS_TYPE_MAP: Record<OutputType, SimNIBSOutputType> = {
-    emag:    "magnJ",
-    jbrain:  "magnJ",
-    voltage: "wm_gm_magnJ",
-  };
-
   const fetchOutput = useCallback(async (type: OutputType): Promise<ArrayBuffer | null> => {
     if (bufferCache.current[type]) return bufferCache.current[type]!;
     try {
-      const blob = solver === "simnibs"
-        ? await getSimNIBSResult(sessionId, modelName, runId, SIMNIBS_TYPE_MAP[type])
-        : await getSimulationResult(sessionId, modelName, runId, type);
+      const blob = await getSimulationResult(sessionId, modelName, runId, type);
       const buf  = await blob.arrayBuffer();
       bufferCache.current[type] = buf;
       return buf;
     } catch {
       return null;
     }
-  }, [sessionId, modelName, runId, solver]);
+  }, [sessionId, modelName, runId]);
+
+  const handleDownload = useCallback(async (type: OutputType) => {
+    let buf = bufferCache.current[type];
+    if (!buf) buf = await fetchOutput(type) ?? undefined;
+    if (!buf) return;
+    const blob = new Blob([buf]);
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    a.href     = url;
+    a.download = `${modelName}_${type}.nii`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [fetchOutput, modelName]);
+
+  const handleElecDownload = useCallback((type: "mask_elec" | "mask_gel") => {
+    const buf = elecBufferCache.current[type];
+    if (!buf) return;
+    const blob = new Blob([buf]);
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    a.href     = url;
+    a.download = `${modelName}_${type}.nii`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [modelName]);
 
   const loadOverlay = useCallback(async (
     nv: Niivue,
@@ -237,9 +231,9 @@ export default function RoastViewer({ inputUrl, sessionId, modelName, runId, sol
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [inputUrl, initialized]);
 
-  // Electrode placement viewers (ROAST only) — two panels, run once after main viewers init
+  // Electrode placement viewers — two panels, run once after main viewers init
   useEffect(() => {
-    if (!initialized || solver === "simnibs") return;
+    if (!initialized) return;
     if (nvElecRef.current || nvGelRef.current) return;
     if (!canvasElecRef.current || !canvasGelRef.current || !canvasCombinedRef.current) return;
     let mounted = true;
@@ -290,6 +284,10 @@ export default function RoastViewer({ inputUrl, sessionId, modelName, runId, sol
       if (!mounted) return;
 
       if (!elecBuf && !gelBuf) { setElecError(true); return; }
+
+      // Cache for download
+      if (elecBuf) elecBufferCache.current["mask_elec"] = elecBuf;
+      if (gelBuf)  elecBufferCache.current["mask_gel"]  = gelBuf;
 
       // Load into individual viewers + combined
       if (elecBuf) {
@@ -346,7 +344,7 @@ export default function RoastViewer({ inputUrl, sessionId, modelName, runId, sol
     initElec().catch(() => { if (mounted) setElecError(true); });
     return () => { mounted = false; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [initialized, inputUrl, sessionId, modelName, runId, solver]);
+  }, [initialized, inputUrl, sessionId, modelName, runId]);
 
   // Sync electrode mask opacity across all electrode viewers
   useEffect(() => {
@@ -605,6 +603,16 @@ export default function RoastViewer({ inputUrl, sessionId, modelName, runId, sol
                 <span className="text-xs font-mono text-foreground-muted bg-border/50 px-2 py-0.5 rounded">
                   {panel.unit}
                 </span>
+                <button
+                  type="button"
+                  onClick={() => handleDownload(panel.type)}
+                  disabled={!!loadErrors[panel.type] || !initialized}
+                  title={`Download ${panel.label}`}
+                  className="flex items-center gap-1 rounded-lg border border-border bg-background px-2 py-1 text-xs font-medium text-foreground-muted transition-colors hover:border-accent/40 hover:text-foreground focus:outline-none focus:ring-2 focus:ring-ring disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  <Download className="h-3 w-3" aria-hidden="true" />
+                  .nii
+                </button>
               </div>
             </header>
 
@@ -664,8 +672,7 @@ export default function RoastViewer({ inputUrl, sessionId, modelName, runId, sol
           </article>
         ))}
 
-        {/* Electrode placement — ROAST only, two side-by-side panels matching SplitViewer style */}
-        {solver !== "simnibs" && (
+        {/* Electrode placement panels */}
         <>
           {/* Controls bar */}
           <div className="flex flex-wrap items-center gap-4 rounded-xl border border-border bg-surface px-4 py-3">
@@ -816,7 +823,19 @@ export default function RoastViewer({ inputUrl, sessionId, modelName, runId, sol
                       <h3 className="text-sm font-semibold text-foreground">Electrode Pad</h3>
                       <p className="text-xs text-foreground-muted">Rubber contact mask</p>
                     </div>
-                    <span className="text-xs font-mono text-foreground-muted bg-border/50 px-2 py-0.5 rounded">mask_elec</span>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-mono text-foreground-muted bg-border/50 px-2 py-0.5 rounded">mask_elec</span>
+                      <button
+                        type="button"
+                        onClick={() => handleElecDownload("mask_elec")}
+                        disabled={!elecHasElec}
+                        title="Download electrode mask"
+                        className="flex items-center gap-1 rounded-lg border border-border bg-background px-2 py-1 text-xs font-medium text-foreground-muted transition-colors hover:border-accent/40 hover:text-foreground focus:outline-none focus:ring-2 focus:ring-ring disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        <Download className="h-3 w-3" aria-hidden="true" />
+                        .nii
+                      </button>
+                    </div>
                   </header>
                   <div className="relative bg-black" style={{ height: elecViewMode === "3d" ? "500px" : "460px" }}>
                     <canvas
@@ -880,7 +899,19 @@ export default function RoastViewer({ inputUrl, sessionId, modelName, runId, sol
                       <h3 className="text-sm font-semibold text-foreground">Gel Layer</h3>
                       <p className="text-xs text-foreground-muted">Conductive gel mask</p>
                     </div>
-                    <span className="text-xs font-mono text-foreground-muted bg-border/50 px-2 py-0.5 rounded">mask_gel</span>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-mono text-foreground-muted bg-border/50 px-2 py-0.5 rounded">mask_gel</span>
+                      <button
+                        type="button"
+                        onClick={() => handleElecDownload("mask_gel")}
+                        disabled={!elecHasGel}
+                        title="Download gel layer mask"
+                        className="flex items-center gap-1 rounded-lg border border-border bg-background px-2 py-1 text-xs font-medium text-foreground-muted transition-colors hover:border-accent/40 hover:text-foreground focus:outline-none focus:ring-2 focus:ring-ring disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        <Download className="h-3 w-3" aria-hidden="true" />
+                        .nii
+                      </button>
+                    </div>
                   </header>
                   <div className="relative bg-black" style={{ height: elecViewMode === "3d" ? "500px" : "460px" }}>
                     <canvas
@@ -939,7 +970,6 @@ export default function RoastViewer({ inputUrl, sessionId, modelName, runId, sol
             </div>
           )}
         </>
-        )}
       </div>
 
       <p className="text-xs text-foreground-muted">
